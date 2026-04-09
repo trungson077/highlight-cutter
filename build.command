@@ -41,7 +41,7 @@ info "Python: $(which python3)"
 # ── Kiem tra cac package can thiet ──
 echo ""
 echo "--- Kiem tra dependencies ---"
-for pkg in flet faster-whisper pyinstaller; do
+for pkg in flet faster-whisper pyinstaller torch torchvision tqdm Pillow pims av; do
     if pip show "$pkg" &>/dev/null; then
         info "$pkg da co"
     else
@@ -67,9 +67,21 @@ pyinstaller \
     --collect-all faster_whisper \
     --collect-all ctranslate2 \
     --collect-all flet \
+    --collect-all torch \
+    --collect-all torchvision \
+    --collect-all tqdm \
+    --collect-all pims \
+    --collect-all av \
     --hidden-import flet \
     --hidden-import faster_whisper \
     --hidden-import ctranslate2 \
+    --hidden-import torch \
+    --hidden-import torchvision \
+    --hidden-import tqdm \
+    --hidden-import PIL \
+    --hidden-import pims \
+    --hidden-import av \
+    --add-data "$SCRIPT_DIR/RobustVideoMatting:RobustVideoMatting" \
     app.py
 
 # Don dep thu muc tam
@@ -87,6 +99,7 @@ if [[ -d "$BUILD_OUTPUT/Highlight Comedy Cutter.app" ]]; then
     echo "  - Van can cai Claude Code:   npm install -g @anthropic-ai/claude-code"
     echo "  - Lan dau chay can dang nhap Claude: chay 'claude' trong Terminal"
     echo "  - Whisper model tiny (~75MB) se tu tai lan dau su dung"
+    echo "  - RVM model se tu tai qua torch.hub lan dau bat 'Tach background'"
     echo ""
     open "$BUILD_OUTPUT"
 else

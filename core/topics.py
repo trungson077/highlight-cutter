@@ -104,6 +104,10 @@ def concat_topics(
     ctx.check_cancelled()
 
     topics_dir = batch_dir / "topics"
+    # Clean old topics dir to avoid stale cache
+    if topics_dir.exists():
+        shutil.rmtree(topics_dir)
+        ctx.log("  Da xoa thu muc topics cu")
     topics_dir.mkdir(parents=True, exist_ok=True)
 
     # Separate grouped (>1 clip) from ungrouped (1 clip)
@@ -151,15 +155,25 @@ def concat_topics(
         topic_dir.mkdir(parents=True, exist_ok=True)
 
         ctx.set_step(
-            3,
+            5,
             "running",
             (t_idx + 0.3) / total_topics,
             f"Dang ghep '{topic}': {len(clips)} clip",
         )
         ctx.log(f"  Chu de '{topic}': {len(clips)} clip")
 
-        # Concat video
-        clip_paths = [c["_clip_path"] for c in clips]
+        # Concat video - only use clips that actually exist
+        clip_paths = [
+            c["_clip_path"] for c in clips
+            if Path(c["_clip_path"]).exists() and Path(c["_clip_path"]).stat().st_size > 1000
+        ]
+        if not clip_paths:
+            ctx.log(f"    CANH BAO: khong co clip hop le cho '{topic}', bo qua")
+            continue
+
+        if len(clip_paths) < len(clips):
+            ctx.log(f"    CANH BAO: chi co {len(clip_paths)}/{len(clips)} clip hop le")
+
         output_video = topic_dir / f"{safe_topic}_compilation.mp4"
 
         if len(clip_paths) == 1:
@@ -172,7 +186,7 @@ def concat_topics(
 
         # Generate YouTube SEO with Claude
         ctx.set_step(
-            3,
+            5,
             "running",
             (t_idx + 0.7) / total_topics,
             f"Dang tao tieu de YouTube cho '{topic}'...",
@@ -181,15 +195,27 @@ def concat_topics(
 
         seo_data = generate_youtube_seo(topic, clips, model, ctx)
 
-        # Write YouTube info file
+        # Determine final title from SEO data
+        final_title = seo_data.get("youtube_title") or f"Best of {topic.title()} - Comedy Highlights Compilation"
+
+        # Create filesystem-safe name from SEO title (keep spaces, emoji, |, etc.)
+        safe_final = final_title
+        for ch in '/\\:*?"<>\n\r':
+            safe_final = safe_final.replace(ch, "")
+        safe_final = safe_final.strip()
+        if not safe_final:
+            safe_final = safe_topic
+
+        # Rename video file to match SEO title
+        new_video = topic_dir / f"{safe_final}.mp4"
+        if output_video.exists() and new_video != output_video:
+            output_video.rename(new_video)
+            ctx.log(f"    Da doi ten video: {new_video.name}")
+
+        # Write YouTube info file (folder stays as safe_topic, only video uses SEO title)
         yt_path = topic_dir / f"{safe_topic}_youtube.txt"
         with open(yt_path, "w", encoding="utf-8") as f:
-            if seo_data.get("youtube_title"):
-                f.write(f"TITLE:\n{seo_data['youtube_title']}\n\n")
-            else:
-                f.write(
-                    f"TITLE:\nBest of {topic.title()} - Comedy Highlights Compilation\n\n"
-                )
+            f.write(f"TITLE:\n{final_title}\n\n")
             if seo_data.get("youtube_description"):
                 f.write(
                     f"DESCRIPTION:\n{seo_data['youtube_description']}\n\n"
@@ -197,8 +223,7 @@ def concat_topics(
             if seo_data.get("youtube_tags"):
                 f.write(f"TAGS:\n{seo_data['youtube_tags']}\n\n")
 
-        if seo_data.get("youtube_title"):
-            ctx.log(f"    YouTube title: {seo_data['youtube_title']}")
+        ctx.log(f"    YouTube title: {final_title}")
 
         # Write detailed info file
         info_path = topic_dir / f"{safe_topic}_info.txt"

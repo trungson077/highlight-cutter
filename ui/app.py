@@ -10,7 +10,12 @@ from datetime import datetime
 
 import flet as ft
 
-from config import SEGMENTATION_PROMPT, HIGHLIGHT_SELECTION_PROMPT, VIDEO_EXTENSIONS, CLAUDE_BIN
+from config import (
+    SEGMENTATION_PROMPT,
+    HIGHLIGHT_SELECTION_PROMPT,
+    VIDEO_EXTENSIONS,
+    CLAUDE_BIN,
+)
 from core.context import PipelineContext
 from core.batch import find_or_create_batch_dir, save_manifest
 from core.transcriber import transcribe_video
@@ -18,6 +23,8 @@ from core.analyzer import segment_stories, select_highlights
 from core.cutter import cut_video
 from core.concat import deduplicate_clips, raw_topic_map
 from core.topics import group_topics_with_claude, concat_topics
+from core.matting import remove_background
+from core.subtitles import burn_subtitles_on_clips
 
 
 class HighlightApp:
@@ -30,6 +37,8 @@ class HighlightApp:
         self.page.theme_mode = ft.ThemeMode.DARK
 
         self.video_queue: list[str] = []
+        self.folder_queue: list[Path] = []
+        self._input_folder_name: str = ""
         self._config_path = Path.home() / ".highlight_comedy_config.json"
         self._load_config()
         self._cancelled = False
@@ -49,6 +58,8 @@ class HighlightApp:
         default_dir = Path.home() / "Desktop" / "highlights_output"
         self._saved_seg_prompt = ""
         self._saved_hl_prompt = ""
+        self._bg_paths = []
+        self._saved_bg_enabled = True
         try:
             if self._config_path.exists():
                 cfg = json.loads(self._config_path.read_text(encoding="utf-8"))
@@ -56,6 +67,14 @@ class HighlightApp:
                 self.output_dir = Path(saved) if saved else default_dir
                 self._saved_seg_prompt = cfg.get("segmentation_prompt", "")
                 self._saved_hl_prompt = cfg.get("highlight_prompt", "")
+                # Migrate old single bg_path to list
+                old_bg = cfg.get("bg_path", "")
+                bg_list = cfg.get("bg_paths", [])
+                if bg_list:
+                    self._bg_paths = [p for p in bg_list if p]
+                elif old_bg:
+                    self._bg_paths = [old_bg]
+                self._saved_bg_enabled = cfg.get("bg_enabled", False)
             else:
                 self.output_dir = default_dir
         except Exception:
@@ -67,6 +86,10 @@ class HighlightApp:
             if self._config_path.exists():
                 cfg = json.loads(self._config_path.read_text(encoding="utf-8"))
             cfg["output_dir"] = str(self.output_dir)
+            cfg["bg_paths"] = self._bg_paths or []
+            cfg["bg_enabled"] = (
+                self.bg_switch.value if hasattr(self, "bg_switch") else False
+            )
             self._config_path.write_text(
                 json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -82,8 +105,12 @@ class HighlightApp:
             seg_val = self.seg_prompt_field.value or ""
             hl_val = self.hl_prompt_field.value or ""
             # Only save if different from default
-            cfg["segmentation_prompt"] = seg_val if seg_val != SEGMENTATION_PROMPT else ""
-            cfg["highlight_prompt"] = hl_val if hl_val != HIGHLIGHT_SELECTION_PROMPT else ""
+            cfg["segmentation_prompt"] = (
+                seg_val if seg_val != SEGMENTATION_PROMPT else ""
+            )
+            cfg["highlight_prompt"] = (
+                hl_val if hl_val != HIGHLIGHT_SELECTION_PROMPT else ""
+            )
             self._config_path.write_text(
                 json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -132,9 +159,7 @@ class HighlightApp:
             icon=ft.Icons.RESTORE,
             on_click=lambda _: self._reset_prompt(),
         )
-        self.prompt_status = ft.Text(
-            "", size=11, color=ft.Colors.GREEN_400
-        )
+        self.prompt_status = ft.Text("", size=11, color=ft.Colors.GREEN_400)
 
         # Manual tab switcher for prompt editor
         self._prompt_tab_idx = 0
@@ -214,10 +239,12 @@ class HighlightApp:
         # Per-step progress rows
         self.step_data = []
         step_names = [
-            ("1. Phien am", ft.Icons.MIC, "Whisper tiny"),
+            ("1. Phien am", ft.Icons.MIC, "WT"),
             ("2. Phan doan + Chon", ft.Icons.PSYCHOLOGY, "Claude AI x2"),
             ("3. Cat clip", ft.Icons.CONTENT_CUT, "FFmpeg"),
-            ("4. Ghep theo chu de", ft.Icons.MERGE_TYPE, "FFmpeg"),
+            ("4. Tach background", ft.Icons.AUTO_FIX_HIGH, "RVM"),
+            ("5. Gan phu de", ft.Icons.SUBTITLES, "FFmpeg"),
+            ("6. Ghep theo chu de", ft.Icons.MERGE_TYPE, "FFmpeg"),
         ]
         step_controls = []
         for name, icon, desc in step_names:
@@ -319,6 +346,98 @@ class HighlightApp:
             bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.YELLOW),
         )
 
+        # Background removal settings
+        self.bg_switch = ft.Switch(
+            label="Tach background",
+            value=self._saved_bg_enabled,
+        )
+        self.bg_path_text = ft.Text(
+            self._bg_paths_label(),
+            size=12,
+            color=ft.Colors.GREY_400,
+            expand=True,
+        )
+        self.bg_pick_btn = ft.ElevatedButton(
+            "Chon Background",
+            icon=ft.Icons.IMAGE,
+            on_click=self._pick_background,
+        )
+        self.bg_clear_btn = ft.IconButton(
+            ft.Icons.CLEAR,
+            icon_size=16,
+            tooltip="Xoa background",
+            on_click=self._clear_background,
+        )
+        self.bg_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Background Removal",
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                    ),
+                    ft.Text(
+                        "Tach nen video va thay bang anh (.jpg/.png) hoac video (.mp4) background.",
+                        size=11,
+                        color=ft.Colors.GREY_400,
+                    ),
+                    self.bg_switch,
+                    ft.Row(
+                        [
+                            ft.Icon(
+                                ft.Icons.IMAGE,
+                                size=18,
+                                color=ft.Colors.TEAL_400,
+                            ),
+                            ft.Text(
+                                "BG:",
+                                size=12,
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                            self.bg_path_text,
+                            self.bg_pick_btn,
+                            self.bg_clear_btn,
+                        ],
+                        spacing=6,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=6,
+            ),
+            border=ft.border.all(1, ft.Colors.OUTLINE),
+            border_radius=8,
+            padding=10,
+            bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.TEAL),
+        )
+
+        # Subtitle settings
+        self.sub_switch = ft.Switch(
+            label="Gan phu de vao clip",
+            value=True,
+        )
+        self.sub_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Phu de (Subtitles)",
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                    ),
+                    ft.Text(
+                        "Tu dong trich xuat phu de tu SRT va gan vao clip truoc khi ghep.",
+                        size=11,
+                        color=ft.Colors.GREY_400,
+                    ),
+                    self.sub_switch,
+                ],
+                spacing=6,
+            ),
+            border=ft.border.all(1, ft.Colors.OUTLINE),
+            border_radius=8,
+            padding=10,
+            bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.PURPLE),
+        )
+
         # Output folder picker
         self.output_dir_text = ft.Text(
             str(self.output_dir), size=12, color=ft.Colors.GREY_400, expand=True
@@ -368,9 +487,9 @@ class HighlightApp:
 
         # Buttons
         self.add_btn = ft.ElevatedButton(
-            "Them video",
-            icon=ft.Icons.VIDEO_FILE,
-            on_click=self._pick_videos,
+            "Chon thu muc cha",
+            icon=ft.Icons.FOLDER_OPEN,
+            on_click=self._pick_video_folder,
             disabled=True,
         )
         clear_btn = ft.OutlinedButton(
@@ -413,6 +532,8 @@ class HighlightApp:
                 [
                     ft.Row([self.model_dropdown], spacing=10),
                     self.merge_container,
+                    self.bg_container,
+                    self.sub_container,
                     self.prompt_toggle,
                     self.prompt_container,
                     self._make_drag_handle("prompt"),
@@ -468,7 +589,7 @@ class HighlightApp:
                     ft.Row(
                         [
                             ft.Text(
-                                "Danh sach video",
+                                "Hang doi folder",
                                 weight=ft.FontWeight.BOLD,
                                 size=12,
                             ),
@@ -521,10 +642,14 @@ class HighlightApp:
     # ── UI Event Handlers ──
 
     async def _pick_output_folder(self, _):
-        result = await self.file_picker.get_directory_path(
-            dialog_title="Chon thu muc output",
-            initial_directory=str(self.output_dir),
-        )
+        try:
+            result = await self.file_picker.get_directory_path(
+                dialog_title="Chon thu muc output",
+                initial_directory=str(self.output_dir),
+            )
+        except Exception as e:
+            self._log(f"LOI chon thu muc output: {e}")
+            return
         if result:
             self.output_dir = Path(result)
             self.output_dir_text.value = str(self.output_dir)
@@ -724,7 +849,7 @@ class HighlightApp:
         self.page.update()
 
     def _reset_steps(self):
-        for i in range(4):
+        for i in range(6):
             self._set_step(i, "pending")
 
     def _update_overall(self, value: float, text: str = ""):
@@ -746,23 +871,104 @@ class HighlightApp:
 
     # ── File Management ──
 
-    async def _pick_videos(self, _):
-        files = await self.file_picker.pick_files(
-            allow_multiple=True,
-            allowed_extensions=VIDEO_EXTENSIONS,
-            dialog_title="Select video files",
-        )
-        if files:
-            for f in files:
-                if f.path not in self.video_queue:
-                    self.video_queue.append(f.path)
-                    self._log(f"Da them: {Path(f.path).name}")
+    async def _pick_video_folder(self, _):
+        try:
+            result = await self.file_picker.get_directory_path(
+                dialog_title="Chon thu muc cha chua cac folder video",
+            )
+        except Exception as e:
+            self._log(f"LOI chon thu muc: {e}")
+            return
+        if result:
+            parent = Path(result)
+            video_exts = {f".{e}" for e in VIDEO_EXTENSIONS}
+
+            # Find subfolders that contain video files
+            subfolders = []
+            for sub in sorted(parent.iterdir()):
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                videos = [
+                    f for f in sub.iterdir()
+                    if f.is_file() and f.suffix.lower() in video_exts
+                    and not f.name.startswith("._")
+                ]
+                if videos:
+                    subfolders.append(sub)
+
+            if not subfolders:
+                # Fallback: treat parent itself as the only folder if it has videos
+                videos = sorted(
+                    f for f in parent.iterdir()
+                    if f.is_file() and f.suffix.lower() in video_exts
+                    and not f.name.startswith("._")
+                )
+                if videos:
+                    subfolders = [parent]
+                else:
+                    self._log(f"Khong tim thay folder video nao trong: {parent.name}")
+                    return
+
+            self.folder_queue = subfolders
+            self._log(f"Thu muc cha: {parent.name} ({len(self.folder_queue)} folder)")
+            for folder in self.folder_queue:
+                vcount = sum(
+                    1 for f in folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in video_exts
+                    and not f.name.startswith("._")
+                )
+                self._log(f"  + {folder.name}: {vcount} video")
             self._refresh_video_list()
 
     def _clear_all(self, _):
         self.video_queue.clear()
+        self.folder_queue.clear()
+        self._input_folder_name = ""
         self._refresh_video_list()
         self._log("Da xoa tat ca.")
+
+    def _bg_paths_label(self) -> str:
+        if not self._bg_paths:
+            return "Chua chon"
+        names = [Path(p).name for p in self._bg_paths]
+        if len(names) <= 2:
+            return ", ".join(names)
+        return f"{names[0]}, {names[1]} ... (+{len(names) - 2})"
+
+    async def _pick_background(self, _):
+        try:
+            files = await self.file_picker.pick_files(
+                allow_multiple=True,
+                allowed_extensions=[
+                    "jpg",
+                    "jpeg",
+                    "png",
+                    "bmp",
+                    "mp4",
+                    "avi",
+                    "mov",
+                    "mkv",
+                ],
+                dialog_title="Chon anh hoac video lam background (chon nhieu file)",
+            )
+        except Exception as e:
+            self._log(f"LOI chon background: {e}")
+            return
+        if files:
+            new_paths = [f.path for f in files]
+            # Append to existing list, avoid duplicates
+            for p in new_paths:
+                if p not in self._bg_paths:
+                    self._bg_paths.append(p)
+            self.bg_path_text.value = self._bg_paths_label()
+            self._save_config()
+            self.page.update()
+
+    def _clear_background(self, _):
+        self._bg_paths = []
+        self.bg_path_text.value = "Chua chon"
+        self._save_config()
+        self.page.update()
 
     def _refresh_all(self, _):
         self._cancelled = True
@@ -773,6 +979,7 @@ class HighlightApp:
                 pass
 
         self.video_queue.clear()
+        self.folder_queue.clear()
         self._refresh_video_list()
         self._reset_steps()
 
@@ -795,39 +1002,51 @@ class HighlightApp:
 
     def _refresh_video_list(self):
         self.video_list.controls.clear()
-        count = len(self.video_queue)
-        self.video_count_text.value = f"{count} video"
-        for i, path in enumerate(self.video_queue):
+        video_exts = {f".{e}" for e in VIDEO_EXTENSIONS}
+        total_videos = 0
+        for i, folder in enumerate(self.folder_queue):
+            vcount = sum(
+                1 for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in video_exts
+                and not f.name.startswith("._")
+            )
+            total_videos += vcount
             self.video_list.controls.append(
                 ft.Container(
                     content=ft.Row(
                         [
                             ft.Icon(
-                                ft.Icons.VIDEO_FILE,
-                                color=ft.Colors.PURPLE_300,
+                                ft.Icons.FOLDER,
+                                color=ft.Colors.AMBER_300,
                                 size=18,
                             ),
-                            ft.Text(Path(path).name, size=12, expand=True),
+                            ft.Text(
+                                f"{folder.name} ({vcount} video)",
+                                size=12,
+                                expand=True,
+                            ),
                             ft.IconButton(
                                 ft.Icons.DELETE,
                                 icon_size=16,
-                                on_click=lambda _, idx=i: self._remove_video(
+                                on_click=lambda _, idx=i: self._remove_folder(
                                     idx
                                 ),
                             ),
                         ]
                     ),
-                    bgcolor=ft.Colors.with_opacity(0.08, ft.Colors.PURPLE),
+                    bgcolor=ft.Colors.with_opacity(0.08, ft.Colors.AMBER),
                     border_radius=6,
                     padding=6,
                 )
             )
+        count = len(self.folder_queue)
+        self.video_count_text.value = f"{count} folder ({total_videos} video)"
         self.page.update()
 
-    def _remove_video(self, idx: int):
-        if 0 <= idx < len(self.video_queue):
-            removed = self.video_queue.pop(idx)
-            self._log(f"Da xoa: {Path(removed).name}")
+    def _remove_folder(self, idx: int):
+        if 0 <= idx < len(self.folder_queue):
+            removed = self.folder_queue.pop(idx)
+            self._log(f"Da xoa folder: {removed.name}")
             self._refresh_video_list()
 
     def _open_output(self, _):
@@ -863,8 +1082,8 @@ class HighlightApp:
             self._log("LOI: Claude Code CLI chua san sang. Kiem tra cai dat.")
             return
 
-        if not self.video_queue:
-            self._log("LOI: Chua co video nao trong danh sach.")
+        if not self.folder_queue:
+            self._log("LOI: Chua co folder nao trong danh sach.")
             return
 
         try:
@@ -902,10 +1121,47 @@ class HighlightApp:
             self.page.update()
 
     async def _pipeline_worker(self):
+        total_folders = len(self.folder_queue)
+        global_start = time.time()
+        video_exts = {f".{e}" for e in VIDEO_EXTENSIONS}
+
+        for folder_idx, folder in enumerate(self.folder_queue):
+            self._check_cancelled()
+
+            # Scan videos in this folder
+            self.video_queue = sorted(
+                str(f) for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in video_exts
+                and not f.name.startswith("._")
+            )
+            if not self.video_queue:
+                self._log(f"Folder {folder.name}: khong co video, bo qua.")
+                continue
+
+            self._input_folder_name = folder.name
+
+            self._log(f"\n{'#'*60}")
+            self._log(
+                f"FOLDER [{folder_idx+1}/{total_folders}]: "
+                f"{folder.name} ({len(self.video_queue)} video)"
+            )
+            self._log(f"{'#'*60}")
+
+            self._reset_steps()
+            self.page.update()
+
+            await self._process_single_folder()
+
+        total_elapsed = time.time() - global_start
+        mins = int(total_elapsed // 60)
+        secs = int(total_elapsed % 60)
+        self._update_status(f"Hoan tat {total_folders} folder! ({mins}p {secs}s)")
+        self._update_overall(1.0, "100% Hoan tat")
+        self._log(f"\nTat ca {total_folders} folder xu ly xong trong {mins}p {secs}s!")
+
+    async def _process_single_folder(self):
         self.output_dir.mkdir(exist_ok=True)
-        self._batch_dir = find_or_create_batch_dir(
-            self.output_dir, self.video_queue
-        )
+        self._batch_dir = self.output_dir / self._input_folder_name
         self._batch_dir.mkdir(parents=True, exist_ok=True)
         save_manifest(self._batch_dir, self.video_queue)
 
@@ -940,22 +1196,18 @@ class HighlightApp:
             subs_dir.mkdir(parents=True, exist_ok=True)
             srt_path = subs_dir / f"{video_name}.srt"
             if srt_path.exists() and srt_path.stat().st_size > 0:
-                self._log(
-                    f"  SRT da ton tai, bo qua phien am: {srt_path.name}"
-                )
+                self._log(f"  SRT da ton tai, bo qua phien am: {srt_path.name}")
                 srt_content = srt_path.read_text(encoding="utf-8")
                 seg_count = srt_content.count("\n-->")
                 self._set_step(
                     0, "done", detail=f"Da co san ({seg_count} doan)"
                 )
             else:
-                self._update_status(
-                    f"{vid_label} Dang phien am: {video_name}"
-                )
+                self._update_status(f"{vid_label} Dang phien am: {video_name}")
                 self._set_step(
                     0, "running", 0, f"Dang tai model cho {video_name}..."
                 )
-                self._log("  Dang phien am voi faster-whisper tiny...")
+                self._log("  Dang phien am...")
                 t0 = time.time()
                 try:
                     srt_content, seg_count = await asyncio.to_thread(
@@ -1002,9 +1254,7 @@ class HighlightApp:
                 )
                 self._log(f"  Da tai {len(highlights)} highlight tu cache")
             else:
-                self._update_status(
-                    f"{vid_label} Dang phan tich: {video_name}"
-                )
+                self._update_status(f"{vid_label} Dang phan tich: {video_name}")
                 self._update_overall((vid_idx + 0.15) / total_videos)
                 t0 = time.time()
 
@@ -1022,11 +1272,18 @@ class HighlightApp:
                         f"Da co {len(segments)} doan, dang chon highlight...",
                     )
                 else:
-                    self._log(f"  Buoc 2a: Phan doan cau chuyen voi Claude ({model})...")
-                    self._set_step(
-                        1, "running", 0, f"Buoc 1/2: Phan doan cau chuyen ({model})..."
+                    self._log(
+                        f"  Buoc 2a: Phan doan cau chuyen voi Claude ({model})..."
                     )
-                    seg_prompt = self.seg_prompt_field.value or SEGMENTATION_PROMPT
+                    self._set_step(
+                        1,
+                        "running",
+                        0,
+                        f"Buoc 1/2: Phan doan cau chuyen ({model})...",
+                    )
+                    seg_prompt = (
+                        self.seg_prompt_field.value or SEGMENTATION_PROMPT
+                    )
                     try:
                         segments = await asyncio.to_thread(
                             segment_stories,
@@ -1044,19 +1301,27 @@ class HighlightApp:
                         continue
 
                     if not segments:
-                        self._log("  Khong tim thay doan cau chuyen nao, bo qua.")
+                        self._log(
+                            "  Khong tim thay doan cau chuyen nao, bo qua."
+                        )
                         self._set_step(1, "error", detail="Khong co segment")
                         continue
 
                     with open(segments_path, "w", encoding="utf-8") as f:
                         json.dump(segments, f, ensure_ascii=False, indent=2)
-                    self._log(f"  Da luu {len(segments)} doan: {segments_path.name}")
+                    self._log(
+                        f"  Da luu {len(segments)} doan: {segments_path.name}"
+                    )
 
                 # Phase 2: Select highlights from segments
-                self._log(f"  Buoc 2b: Chon highlight tu {len(segments)} doan...")
+                self._log(
+                    f"  Buoc 2b: Chon highlight tu {len(segments)} doan..."
+                )
                 self._update_overall((vid_idx + 0.35) / total_videos)
 
-                hl_prompt = self.hl_prompt_field.value or HIGHLIGHT_SELECTION_PROMPT
+                hl_prompt = (
+                    self.hl_prompt_field.value or HIGHLIGHT_SELECTION_PROMPT
+                )
                 try:
                     highlights = await asyncio.to_thread(
                         select_highlights,
@@ -1156,9 +1421,7 @@ class HighlightApp:
                     "done",
                     detail=f"Da cat {ok_count}/{len(highlights)} clip thanh cong",
                 )
-                self._log(
-                    f"  Cat xong: {ok_count}/{len(highlights)} clip"
-                )
+                self._log(f"  Cat xong: {ok_count}/{len(highlights)} clip")
 
             # Store for concat
             for h, clip_path in zip(highlights, clip_paths):
@@ -1180,23 +1443,107 @@ class HighlightApp:
 
         self._check_cancelled()
 
-        # ── Step 4: Concat ──
+        # ── Step 4: Remove Background ──
+        bg_enabled = self.bg_switch.value and self._bg_paths
+        if bg_enabled:
+            self._update_status("Dang tach background...")
+            self._set_step(3, "running", 0, "Dang chuan bi tach background...")
+            self._log(f"\n{'='*60}")
+            self._log("Buoc 4: Tach background voi RobustVideoMatting...")
+            self._log(f"  Background: {len(self._bg_paths)} file")
+
+            # Collect all valid clip paths
+            clip_list = []
+            for entry in all_highlights:
+                for h in entry["highlights"]:
+                    if "_clip_path" in h and Path(h["_clip_path"]).exists():
+                        clip_list.append(h["_clip_path"])
+
+            if clip_list:
+                matted_dir = self._batch_dir / "matted"
+                matted_paths = await asyncio.to_thread(
+                    remove_background,
+                    clip_list,
+                    self._bg_paths,
+                    matted_dir,
+                    self._ctx,
+                )
+
+                # Build mapping old_path -> new_path
+                path_map = {}
+                for old, new in zip(clip_list, matted_paths):
+                    if new:
+                        path_map[old] = new
+
+                # Update clip paths in highlights
+                for entry in all_highlights:
+                    for h in entry["highlights"]:
+                        if "_clip_path" in h and h["_clip_path"] in path_map:
+                            h["_clip_path"] = path_map[h["_clip_path"]]
+
+                ok_count = sum(
+                    1 for p in matted_paths
+                    if p and Path(p).exists() and Path(p).stat().st_size > 1000
+                )
+                self._set_step(
+                    3,
+                    "done",
+                    detail=f"Da tach BG {ok_count}/{len(clip_list)} clip",
+                )
+                self._log(f"  Tach BG xong: {ok_count}/{len(clip_list)} clip")
+            else:
+                self._set_step(3, "done", detail="Khong co clip de tach BG")
+        else:
+            self._set_step(3, "done", detail="Bo qua (khong bat)")
+
+        self._check_cancelled()
+
+        # ── Step 5: Burn Subtitles ──
+        if self.sub_switch.value:
+            self._update_status("Dang gan phu de...")
+            self._set_step(4, "running", 0, "Dang chuan bi gan phu de...")
+            self._log(f"\n{'='*60}")
+            self._log("Buoc 5: Gan phu de vao clip...")
+
+            sub_count = await asyncio.to_thread(
+                burn_subtitles_on_clips,
+                all_highlights,
+                self._batch_dir,
+                self._ctx,
+            )
+
+            self._set_step(4, "done", detail=f"Da gan phu de {sub_count} clip")
+            self._log(f"  Gan phu de xong: {sub_count} clip")
+        else:
+            self._set_step(4, "done", detail="Bo qua (khong bat)")
+
+        self._check_cancelled()
+
+        # ── Step 6: Concat ──
         self._update_status("Dang chuan bi ghep...")
-        self._set_step(
-            3, "running", 0, "Dang phan tich clip de gop nhom..."
-        )
+        self._set_step(5, "running", 0, "Dang phan tich clip de gop nhom...")
         self._log(f"\n{'='*60}")
-        self._log("Buoc 4: Chuan bi ghep video...")
+        self._log("Buoc 6: Chuan bi ghep video...")
 
         all_clips = []
+        skipped = 0
         for entry in all_highlights:
             for h in entry["highlights"]:
-                if "_clip_path" in h and Path(h["_clip_path"]).exists():
+                if "_clip_path" not in h:
+                    skipped += 1
+                    continue
+                p = Path(h["_clip_path"])
+                if p.exists() and p.stat().st_size > 1000:
                     all_clips.append(h)
+                else:
+                    skipped += 1
+                    self._log(f"  CANH BAO: clip khong hop le, bo qua: {p.name}")
+        if skipped:
+            self._log(f"  Da bo qua {skipped} clip khong hop le")
 
         if not all_clips:
             self._log("  Khong co clip nao de ghep.")
-            self._set_step(3, "error", detail="Khong co clip")
+            self._set_step(5, "error", detail="Khong co clip")
             return
 
         before_dedup = len(all_clips)
@@ -1212,7 +1559,7 @@ class HighlightApp:
 
         if merge_enabled and len(all_clips) > 1:
             self._set_step(
-                3,
+                5,
                 "running",
                 0.05,
                 "Dang nho Claude gop chu de tuong tu...",
@@ -1264,14 +1611,11 @@ class HighlightApp:
             self._ctx,
         )
 
-        self._set_step(
-            3, "done", detail=f"Da tao {topic_count} thu muc chu de"
-        )
+        self._set_step(5, "done", detail=f"Da tao {topic_count} thu muc chu de")
 
         total_elapsed = time.time() - start_time
         mins = int(total_elapsed // 60)
         secs = int(total_elapsed % 60)
-        self._update_status(f"Hoan tat! ({mins}p {secs}s)")
-        self._update_overall(1.0, "100% Hoan tat")
-        self._log(f"\nXu ly hoan tat trong {mins}p {secs}s!")
+        self._update_overall(1.0, f"Folder {self._input_folder_name} xong")
+        self._log(f"\nFolder {self._input_folder_name} hoan tat trong {mins}p {secs}s!")
         self._log(f"Ket qua: {self._batch_dir.resolve()}")

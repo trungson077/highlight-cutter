@@ -82,7 +82,7 @@ def cut_video(
         cmd = [
             FFMPEG_BIN,
             "-ss",
-            h["start_time"],
+            h["start_time"].replace(",", "."),
             "-i",
             video_path,
             "-t",
@@ -113,8 +113,9 @@ def cut_video(
                 ctx.log(f"    [{i}/{total}] Cut: {output_name}")
                 clip_paths.append(output_path)
             else:
+                # Show last 500 chars of stderr (skip ffmpeg banner to see actual error)
                 ctx.log(
-                    f"    [{i}/{total}] FAILED: {output_name} - {stderr[:150]}"
+                    f"    [{i}/{total}] FAILED: {output_name} - {stderr[-500:]}"
                 )
                 clip_paths.append(None)
         except subprocess.TimeoutExpired:
