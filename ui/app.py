@@ -23,7 +23,7 @@ from core.analyzer import segment_stories, select_highlights
 from core.cutter import cut_video
 from core.concat import deduplicate_clips, raw_topic_map
 from core.topics import group_topics_with_claude, concat_topics
-from core.matting import remove_background
+from core.matting import remove_background, create_tiktok_versions
 from core.subtitles import burn_subtitles_on_clips
 
 
@@ -312,6 +312,67 @@ class HighlightApp:
             color=ft.Colors.BLUE_200,
         )
 
+        # Cut-only mode: skip concat final
+        self.cut_only_switch = ft.Switch(
+            label="Chi cat highlight (bo qua ghep video)",
+            value=False,
+        )
+        self.cut_only_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Che do cat nhanh",
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                    ),
+                    ft.Text(
+                        "Khi bat, chi thuc hien cat cac doan highlight (+ tach BG, gan sub neu bat). "
+                        "Bo qua buoc ghep video cuoi cung (ca YouTube lan TikTok).",
+                        size=11,
+                        color=ft.Colors.GREY_400,
+                    ),
+                    self.cut_only_switch,
+                ],
+                spacing=6,
+            ),
+            border=ft.border.all(1, ft.Colors.OUTLINE),
+            border_radius=8,
+            padding=10,
+            bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.ORANGE),
+        )
+
+        # Raw-cut-only mode: cut highlights from the source video and stop
+        # (no background removal, no subtitles, no concat).
+        self.raw_cut_switch = ft.Switch(
+            label="Chi cat highlight tho tu video goc",
+            value=False,
+            on_change=self._on_raw_cut_change,
+        )
+        self.raw_cut_container = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Che do cat tho",
+                        weight=ft.FontWeight.BOLD,
+                        size=13,
+                    ),
+                    ft.Text(
+                        "Khi bat, CHI cat cac doan highlight tu video goc roi dung. "
+                        "Bo qua tach background, gan phu de va ghep video. "
+                        "(Cac tuy chon ben duoi se bi vo hieu hoa.)",
+                        size=11,
+                        color=ft.Colors.GREY_400,
+                    ),
+                    self.raw_cut_switch,
+                ],
+                spacing=6,
+            ),
+            border=ft.border.all(1, ft.Colors.OUTLINE),
+            border_radius=8,
+            padding=10,
+            bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.RED),
+        )
+
         # Merge similar topics option
         self.merge_switch = ft.Switch(label="Gop chu de tuong tu", value=True)
         self.merge_count = ft.TextField(
@@ -531,6 +592,8 @@ class HighlightApp:
             content=ft.Column(
                 [
                     ft.Row([self.model_dropdown], spacing=10),
+                    self.raw_cut_container,
+                    self.cut_only_container,
                     self.merge_container,
                     self.bg_container,
                     self.sub_container,
@@ -658,6 +721,19 @@ class HighlightApp:
 
     def _toggle_settings(self, _):
         self.settings_content.visible = not self.settings_content.visible
+        self.page.update()
+
+    def _on_raw_cut_change(self, _):
+        # Raw-cut mode skips every post-cut step, so disable the dependent
+        # options to make it clear they have no effect while it is on.
+        raw = self.raw_cut_switch.value
+        for sw in (
+            self.cut_only_switch,
+            self.merge_switch,
+            self.bg_switch,
+            self.sub_switch,
+        ):
+            sw.disabled = raw
         self.page.update()
 
     def _toggle_prompt_editor(self, _):
@@ -1443,8 +1519,12 @@ class HighlightApp:
 
         self._check_cancelled()
 
+        # Raw-cut mode: stop after cutting clips (no BG / sub / concat).
+        raw_cut = self.raw_cut_switch.value
+
         # ── Step 4: Remove Background ──
-        bg_enabled = self.bg_switch.value and self._bg_paths
+        bg_enabled = self.bg_switch.value and self._bg_paths and not raw_cut
+        has_tiktok = False
         if bg_enabled:
             self._update_status("Dang tach background...")
             self._set_step(3, "running", 0, "Dang chuan bi tach background...")
@@ -1485,21 +1565,65 @@ class HighlightApp:
                     1 for p in matted_paths
                     if p and Path(p).exists() and Path(p).stat().st_size > 1000
                 )
+                self._log(f"  Tach BG xong: {ok_count}/{len(clip_list)} clip")
+
+                # ── Create TikTok vertical versions for ALL clips ──
+                # Use current _clip_path (matted if succeeded, original if not)
+                self._log("  Dang tao phien ban TikTok (doc 9:16) cho tat ca clip...")
+                self._set_step(
+                    3, "running", 0.5,
+                    "Dang tao phien ban TikTok (doc)...",
+                )
+                all_current_clips = []
+                for entry in all_highlights:
+                    for h in entry["highlights"]:
+                        if "_clip_path" in h and Path(h["_clip_path"]).exists():
+                            all_current_clips.append(h["_clip_path"])
+
+                if all_current_clips:
+                    tiktok_dir = self._batch_dir / "tiktok"
+                    tiktok_paths = await asyncio.to_thread(
+                        create_tiktok_versions,
+                        all_current_clips,
+                        tiktok_dir,
+                        self._ctx,
+                    )
+
+                    # Build tiktok mapping: current_clip_path -> tiktok_path
+                    tiktok_map = {}
+                    for src_p, tiktok_p in zip(all_current_clips, tiktok_paths):
+                        if tiktok_p:
+                            tiktok_map[src_p] = tiktok_p
+
+                    # Store tiktok clip paths in highlights
+                    for entry in all_highlights:
+                        for h in entry["highlights"]:
+                            cp = h.get("_clip_path", "")
+                            if cp in tiktok_map:
+                                h["_tiktok_clip_path"] = tiktok_map[cp]
+
+                    tk_ok = sum(
+                        1 for p in tiktok_paths
+                        if p and Path(p).exists() and Path(p).stat().st_size > 1000
+                    )
+                    has_tiktok = tk_ok > 0
+                    self._log(f"  TikTok xong: {tk_ok}/{len(all_current_clips)} clip")
+
                 self._set_step(
                     3,
                     "done",
-                    detail=f"Da tach BG {ok_count}/{len(clip_list)} clip",
+                    detail=f"Da tach BG {ok_count}/{len(clip_list)} clip + TikTok {tk_ok if all_current_clips else 0}/{len(all_current_clips) if all_current_clips else 0}",
                 )
-                self._log(f"  Tach BG xong: {ok_count}/{len(clip_list)} clip")
             else:
                 self._set_step(3, "done", detail="Khong co clip de tach BG")
         else:
-            self._set_step(3, "done", detail="Bo qua (khong bat)")
+            detail = "Bo qua (che do cat tho)" if raw_cut else "Bo qua (khong bat)"
+            self._set_step(3, "done", detail=detail)
 
         self._check_cancelled()
 
         # ── Step 5: Burn Subtitles ──
-        if self.sub_switch.value:
+        if self.sub_switch.value and not raw_cut:
             self._update_status("Dang gan phu de...")
             self._set_step(4, "running", 0, "Dang chuan bi gan phu de...")
             self._log(f"\n{'='*60}")
@@ -1511,107 +1635,134 @@ class HighlightApp:
                 self._batch_dir,
                 self._ctx,
             )
+            self._log(f"  Gan phu de YouTube xong: {sub_count} clip")
 
-            self._set_step(4, "done", detail=f"Da gan phu de {sub_count} clip")
-            self._log(f"  Gan phu de xong: {sub_count} clip")
+            # Also burn subtitles on TikTok clips if they exist
+            if has_tiktok:
+                self._log("  Dang gan phu de cho clip TikTok...")
+                tk_sub_count = await asyncio.to_thread(
+                    burn_subtitles_on_clips,
+                    all_highlights,
+                    self._batch_dir,
+                    self._ctx,
+                    "_tiktok_clip_path",
+                )
+                self._log(f"  Gan phu de TikTok xong: {tk_sub_count} clip")
+                self._set_step(
+                    4, "done",
+                    detail=f"Da gan phu de {sub_count} clip YT + {tk_sub_count} clip TikTok",
+                )
+            else:
+                self._set_step(4, "done", detail=f"Da gan phu de {sub_count} clip")
         else:
-            self._set_step(4, "done", detail="Bo qua (khong bat)")
+            detail = "Bo qua (che do cat tho)" if raw_cut else "Bo qua (khong bat)"
+            self._set_step(4, "done", detail=detail)
 
         self._check_cancelled()
 
         # ── Step 6: Concat ──
-        self._update_status("Dang chuan bi ghep...")
-        self._set_step(5, "running", 0, "Dang phan tich clip de gop nhom...")
-        self._log(f"\n{'='*60}")
-        self._log("Buoc 6: Chuan bi ghep video...")
-
-        all_clips = []
-        skipped = 0
-        for entry in all_highlights:
-            for h in entry["highlights"]:
-                if "_clip_path" not in h:
-                    skipped += 1
-                    continue
-                p = Path(h["_clip_path"])
-                if p.exists() and p.stat().st_size > 1000:
-                    all_clips.append(h)
-                else:
-                    skipped += 1
-                    self._log(f"  CANH BAO: clip khong hop le, bo qua: {p.name}")
-        if skipped:
-            self._log(f"  Da bo qua {skipped} clip khong hop le")
-
-        if not all_clips:
-            self._log("  Khong co clip nao de ghep.")
-            self._set_step(5, "error", detail="Khong co clip")
-            return
-
-        before_dedup = len(all_clips)
-        all_clips = deduplicate_clips(all_clips)
-        if len(all_clips) < before_dedup:
-            removed = before_dedup - len(all_clips)
-            self._log(
-                f"  Da loai {removed} clip trung lap ({before_dedup} -> {len(all_clips)})"
-            )
-
-        merge_enabled = self.merge_switch.value
-        max_clips_val = int(self.merge_count.value or "10")
-
-        if merge_enabled and len(all_clips) > 1:
-            self._set_step(
-                5,
-                "running",
-                0.05,
-                "Dang nho Claude gop chu de tuong tu...",
-            )
-            self._log("  Dang nho Claude gop chu de tuong tu...")
-            topic_map = await asyncio.to_thread(
-                group_topics_with_claude, all_clips, model, self._ctx
-            )
-            if not topic_map:
-                self._log("  Claude gop nhom that bai, dung chu de goc")
-                topic_map = raw_topic_map(all_clips)
-            else:
-                self._log(
-                    f"  Claude da gop {len(all_clips)} clip thanh {len(topic_map)} nhom"
-                )
-
-            multi_clip_groups = {
-                k: v for k, v in topic_map.items() if len(v) > 1
-            }
-            if not multi_clip_groups:
-                self._log(
-                    f"  Khong co chu de trung lap ({len(topic_map)} chu de rieng biet), "
-                    "tu dong gop tat ca vao mot video."
-                )
-                topic_map = {"best_highlights": all_clips}
+        if self.cut_only_switch.value or raw_cut:
+            mode_label = "che do cat tho" if raw_cut else "che do chi cat highlight"
+            self._set_step(5, "done", detail=f"Bo qua ({mode_label})")
+            self._log(f"\n{'='*60}")
+            self._log(f"Buoc 6: Bo qua ghep video ({mode_label})")
         else:
-            # Merge OFF: concat ALL clips into one video, sorted by humor_rating (best first)
-            sorted_clips = sorted(
-                all_clips,
-                key=lambda c: c.get("humor_rating", 5),
-                reverse=True,
-            )
-            self._log(
-                f"  Gop nhom da tat: ghep tat ca {len(sorted_clips)} clip thanh 1 video "
-                "(sap xep theo do hai huoc giam dan)"
-            )
-            for i, c in enumerate(sorted_clips):
-                rating = c.get("humor_rating", "?")
-                self._log(f"    #{i+1} [rating={rating}] {c.get('title', '?')}")
-            topic_map = {"best_highlights": sorted_clips}
+            self._update_status("Dang chuan bi ghep...")
+            self._set_step(5, "running", 0, "Dang phan tich clip de gop nhom...")
+            self._log(f"\n{'='*60}")
+            self._log("Buoc 6: Chuan bi ghep video...")
 
-        self._log("  Dang ghep clip theo chu de...")
-        topic_count = await asyncio.to_thread(
-            concat_topics,
-            topic_map,
-            max_clips_val,
-            model,
-            self._batch_dir,
-            self._ctx,
-        )
+            all_clips = []
+            skipped = 0
+            for entry in all_highlights:
+                for h in entry["highlights"]:
+                    if "_clip_path" not in h:
+                        skipped += 1
+                        continue
+                    p = Path(h["_clip_path"])
+                    if p.exists() and p.stat().st_size > 1000:
+                        all_clips.append(h)
+                    else:
+                        skipped += 1
+                        self._log(f"  CANH BAO: clip khong hop le, bo qua: {p.name}")
+            if skipped:
+                self._log(f"  Da bo qua {skipped} clip khong hop le")
 
-        self._set_step(5, "done", detail=f"Da tao {topic_count} thu muc chu de")
+            if not all_clips:
+                self._log("  Khong co clip nao de ghep.")
+                self._set_step(5, "error", detail="Khong co clip")
+                return
+
+            before_dedup = len(all_clips)
+            all_clips = deduplicate_clips(all_clips)
+            if len(all_clips) < before_dedup:
+                removed = before_dedup - len(all_clips)
+                self._log(
+                    f"  Da loai {removed} clip trung lap ({before_dedup} -> {len(all_clips)})"
+                )
+
+            merge_enabled = self.merge_switch.value
+            max_clips_val = int(self.merge_count.value or "10")
+
+            if merge_enabled and len(all_clips) > 1:
+                self._set_step(
+                    5,
+                    "running",
+                    0.05,
+                    "Dang nho Claude gop chu de tuong tu...",
+                )
+                self._log("  Dang nho Claude gop chu de tuong tu...")
+                topic_map = await asyncio.to_thread(
+                    group_topics_with_claude, all_clips, model, self._ctx
+                )
+                if not topic_map:
+                    self._log("  Claude gop nhom that bai, dung chu de goc")
+                    topic_map = raw_topic_map(all_clips)
+                else:
+                    self._log(
+                        f"  Claude da gop {len(all_clips)} clip thanh {len(topic_map)} nhom"
+                    )
+
+                multi_clip_groups = {
+                    k: v for k, v in topic_map.items() if len(v) > 1
+                }
+                if not multi_clip_groups:
+                    self._log(
+                        f"  Khong co chu de trung lap ({len(topic_map)} chu de rieng biet), "
+                        "tu dong gop tat ca vao mot video."
+                    )
+                    topic_map = {"best_highlights": all_clips}
+            else:
+                # Merge OFF: concat ALL clips into one video, sorted by humor_rating (best first)
+                sorted_clips = sorted(
+                    all_clips,
+                    key=lambda c: c.get("humor_rating", 5),
+                    reverse=True,
+                )
+                self._log(
+                    f"  Gop nhom da tat: ghep tat ca {len(sorted_clips)} clip thanh 1 video "
+                    "(sap xep theo do hai huoc giam dan)"
+                )
+                for i, c in enumerate(sorted_clips):
+                    rating = c.get("humor_rating", "?")
+                    self._log(f"    #{i+1} [rating={rating}] {c.get('title', '?')}")
+                topic_map = {"best_highlights": sorted_clips}
+
+            self._log("  Dang ghep clip theo chu de...")
+            topic_count = await asyncio.to_thread(
+                concat_topics,
+                topic_map,
+                max_clips_val,
+                model,
+                self._batch_dir,
+                self._ctx,
+                has_tiktok,
+            )
+
+            detail = f"Da tao {topic_count} thu muc chu de"
+            if has_tiktok:
+                detail += " (YouTube + TikTok)"
+            self._set_step(5, "done", detail=detail)
 
         total_elapsed = time.time() - start_time
         mins = int(total_elapsed // 60)

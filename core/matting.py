@@ -1,10 +1,12 @@
 """Background removal using RobustVideoMatting."""
 
 import random
+import subprocess
 import sys
 import platform
 from pathlib import Path
 
+from config import FFMPEG_BIN
 from core.context import PipelineContext
 
 _RVM_DIR = Path(__file__).resolve().parent.parent / "RobustVideoMatting"
@@ -134,3 +136,76 @@ def remove_background(
             )  # Mark as failed, don't fallback to missing original
 
     return matted_paths
+
+
+def create_tiktok_versions(
+    clip_paths: list,
+    output_dir: Path,
+    ctx: PipelineContext,
+) -> list:
+    """Create vertical (9:16) versions of clips for TikTok by center-cropping.
+
+    Takes horizontal clips and center-crops them to 9:16 aspect ratio,
+    then scales to 1080x1920.
+    Returns list of new clip paths (tiktok versions).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total = len(clip_paths)
+    tiktok_paths = []
+
+    for i, clip_path in enumerate(clip_paths):
+        ctx.check_cancelled()
+
+        if clip_path is None:
+            tiktok_paths.append(None)
+            continue
+
+        clip_file = Path(clip_path)
+        output_path = output_dir / clip_file.name
+
+        # Skip if already processed
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            ctx.log(f"    [{i+1}/{total}] TikTok da co: {clip_file.name}")
+            tiktok_paths.append(str(output_path))
+            continue
+
+        ctx.set_step(
+            3,
+            "running",
+            i / total,
+            f"Dang tao TikTok {i+1}/{total}: {clip_file.name}",
+        )
+        ctx.log(f"    [{i+1}/{total}] Dang tao TikTok: {clip_file.name}")
+
+        try:
+            # Center-crop to 9:16 aspect ratio, then scale to 1080x1920
+            # crop=ih*9/16:ih  crops width to 9/16 of height, keeping full height
+            # (iw-oh)/2:0     centers the crop horizontally
+            cmd = [
+                FFMPEG_BIN,
+                "-i", str(clip_file),
+                "-vf", "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-y",
+                str(output_path),
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0 and output_path.exists():
+                tiktok_paths.append(str(output_path))
+                ctx.log(f"    [{i+1}/{total}] Xong TikTok: {clip_file.name}")
+            else:
+                ctx.log(
+                    f"    [{i+1}/{total}] LOI TikTok: {clip_file.name}: "
+                    f"{result.stderr[:200]}"
+                )
+                tiktok_paths.append(None)
+        except Exception as e:
+            ctx.log(f"    [{i+1}/{total}] LOI TikTok: {clip_file.name}: {e}")
+            tiktok_paths.append(None)
+
+    return tiktok_paths

@@ -9,9 +9,60 @@ from core.context import PipelineContext
 
 
 def ts_to_secs(ts: str) -> float:
-    """Parse HH:MM:SS or HH:MM:SS,mmm to seconds."""
+    """Parse HH:MM:SS or HH:MM:SS,mmm or MM:SS,mmm to seconds."""
     parts = ts.replace(",", ".").split(":")
-    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    elif len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(parts[0])
+
+
+def normalize_ts(ts: str) -> str:
+    """Normalize any timestamp to HH:MM:SS.mmm for FFmpeg.
+
+    Handles formats like:
+      00:01:34     -> 00:01:34.000
+      00:01:34,500 -> 00:01:34.500
+      30:13:180    -> 00:30:13.180  (MM:SS:mmm misinterpreted as HH:MM:SS)
+      01:34.500    -> 00:01:34.500  (MM:SS.mmm)
+    """
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+
+    if len(parts) == 3:
+        p0, p1, p2 = parts
+        # Detect MM:SS:mmm — 3rd part has no dot AND is exactly 3 digits (milliseconds)
+        # e.g. "30:13:180" means 30m 13s 180ms, "33:00:000" means 33m 00s 000ms
+        # Normal HH:MM:SS would have 1-2 digit seconds, not 3-digit
+        if "." not in p2 and p2.isdigit() and len(p2) == 3:
+            # It's MM:SS:mmm
+            h = 0
+            m = int(p0)
+            s_ms = f"{p1}.{p2}"
+        else:
+            h = int(p0)
+            m = int(p1)
+            s_ms = p2
+    elif len(parts) == 2:
+        h = 0
+        m = int(parts[0])
+        s_ms = parts[1]
+    else:
+        h = 0
+        m = 0
+        s_ms = parts[0]
+
+    # Parse seconds and milliseconds
+    if "." in str(s_ms):
+        s_part, ms_part = str(s_ms).split(".", 1)
+        s = int(s_part)
+        ms = ms_part.ljust(3, "0")[:3]
+    else:
+        s = int(s_ms)
+        ms = "000"
+
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms}"
 
 
 def detect_hw_encoder() -> list[str]:
@@ -36,6 +87,7 @@ def cut_video(
 ) -> list:
     """Cut video into clips based on highlights."""
     clip_paths = []
+    used_names = set()
     ext = Path(video_path).suffix
     total = len(highlights)
 
@@ -46,13 +98,21 @@ def cut_video(
     for i, h in enumerate(highlights, 1):
         ctx.check_cancelled()
 
-        safe_title = (
-            h["title"].replace(" ", "_").replace("'", "").replace('"', "")
-        )
+        safe_title = h["title"].replace("'", "").replace('"', "")
         safe_title = "".join(
-            c for c in safe_title if c.isalnum() or c in "_-"
-        )
-        output_name = f"{i:02d}_{safe_title}{ext}"
+            c for c in safe_title if c.isalnum() or c in " _-"
+        ).strip()
+        if not safe_title:
+            safe_title = f"clip_{i:02d}"
+        output_name = f"{safe_title}{ext}"
+        # Add a numeric suffix only when the name collides with one
+        # already used in this run (e.g. duplicate titles).
+        if output_name in used_names:
+            n = 2
+            while f"{safe_title} ({n}){ext}" in used_names:
+                n += 1
+            output_name = f"{safe_title} ({n}){ext}"
+        used_names.add(output_name)
         output_path = clips_dir / output_name
 
         # Skip if clip already exists
@@ -82,7 +142,7 @@ def cut_video(
         cmd = [
             FFMPEG_BIN,
             "-ss",
-            h["start_time"].replace(",", "."),
+            normalize_ts(h["start_time"]),
             "-i",
             video_path,
             "-t",

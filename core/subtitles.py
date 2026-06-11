@@ -23,6 +23,19 @@ SUB_STYLE = (
     "Alignment=2"
 )
 
+# TikTok vertical (1080x1920): smaller font to fit narrow width
+SUB_STYLE_TIKTOK = (
+    "FontName=Impact,"
+    "FontSize=16,"
+    "Bold=1,"
+    "PrimaryColour=&HFFFFFF,"
+    "OutlineColour=&H000000,"
+    "BorderStyle=1,"
+    "Outline=1,"
+    "Shadow=1,"
+    "Alignment=2"
+)
+
 
 def _parse_srt(srt_content: str) -> list:
     """Parse SRT content into list of (start_secs, end_secs, text) tuples."""
@@ -86,8 +99,12 @@ def burn_subtitles_on_clips(
     all_highlights: list,
     batch_dir: Path,
     ctx: PipelineContext,
+    clip_path_key: str = "_clip_path",
 ) -> int:
     """Burn subtitles directly onto highlight clips (in-place).
+
+    clip_path_key: which key in highlight dict holds the clip path.
+        Default "_clip_path" for YouTube clips, "_tiktok_clip_path" for TikTok.
 
     Returns number of clips successfully subtitled.
     """
@@ -95,7 +112,8 @@ def burn_subtitles_on_clips(
     srt_cache = {}
 
     # Load cache of already-subtitled clips
-    done_file = batch_dir / "_subs_done.json"
+    done_suffix = "" if clip_path_key == "_clip_path" else f"_{clip_path_key}"
+    done_file = batch_dir / f"_subs_done{done_suffix}.json"
     done_set = set()
     if done_file.exists():
         try:
@@ -112,7 +130,7 @@ def burn_subtitles_on_clips(
             srt_cache[video_name] = srt_path.read_text(encoding="utf-8")
 
         for h in entry["highlights"]:
-            if "_clip_path" in h and Path(h["_clip_path"]).exists():
+            if clip_path_key in h and Path(h[clip_path_key]).exists():
                 clips_to_process.append((h, video_name))
 
     total = len(clips_to_process)
@@ -125,7 +143,7 @@ def burn_subtitles_on_clips(
     for i, (h, video_name) in enumerate(clips_to_process):
         ctx.check_cancelled()
 
-        clip_path = Path(h["_clip_path"])
+        clip_path = Path(h[clip_path_key])
 
         # Skip if already burned subs
         if str(clip_path) in done_set:
@@ -173,7 +191,8 @@ def burn_subtitles_on_clips(
             # Output to temp file next to original
             temp_output = clip_path.with_suffix(".tmp.mp4")
 
-            vf_filter = f"subtitles={srt_temp}:force_style='{SUB_STYLE}'"
+            style = SUB_STYLE_TIKTOK if clip_path_key == "_tiktok_clip_path" else SUB_STYLE
+            vf_filter = f"subtitles={srt_temp}:force_style='{style}'"
 
             cmd = [
                 FFMPEG_BIN,
